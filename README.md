@@ -30,7 +30,7 @@ pipx run wheelgap
 
 Or install it: `pip install wheelgap`.
 
-Run either one in a project directory. It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock` or `requirements.txt` on its own.
+Run either one in a project directory. It finds `uv.lock`, `pylock.toml`, `poetry.lock`, `pdm.lock`, `Pipfile.lock`, `requirements.lock` or `requirements.txt` on its own.
 
 ## Usage
 
@@ -56,8 +56,9 @@ wheelgap pdm.lock -p 3.13 -t linux-x86_64,linux-aarch64
 # No lockfile? Check packages directly (latest version, or pin one)
 wheelgap psycopg2 uvloop numpy==2.3.4 -t windows,win-arm64
 
-# Take the target from the last FROM line (e.g. python:3.13-alpine
-# or ghcr.io/astral-sh/uv:0.13.7-python3.13-trixie-slim)
+# Take the target from the final stage's image (e.g. python:3.13-alpine
+# or ghcr.io/astral-sh/uv:0.13.7-python3.13-trixie-slim), following
+# named stages like `FROM base AS runtime` back to the image they start from
 wheelgap --dockerfile Dockerfile
 
 # Machine-readable, for scripts and CI
@@ -97,6 +98,15 @@ armlib 1.4.0 on musl-aarch64: ● source
 
 For `uv.lock` inputs, `--explain` also shows why the package is installed at all: the shortest dependency path from your project (or from a dependency group, shown as `(dev group)`) to the gap package. Paths are worked out per target, since markers can pull a package in on one platform only. With `--json --explain`, each package gets a matching `via` object keyed by target, like `rejected`: `"via": {"win-arm64": ["myapp", "uvicorn", "uvloop"]}`. Other inputs have no dependency graph, so they show no path (and `"via": {}`).
 
+In `--json` output, `results`, `rejected` and `via` are all keyed by target label: just the platform (`"linux-x86_64"`) when one Python is checked, or Python and platform (`"3.13 linux-x86_64"`) with several. The top-level `targets` list gives each target's `label`, `python` and `platform`, so a script can look the key up instead of building it:
+
+```python
+import json
+
+data = json.load(open("wheelgap.json"))
+key = next(t["label"] for t in data["targets"] if t["python"] == "3.13" and t["platform"] == "linux-x86_64")
+```
+
 ```
 uvloop 0.21.0 on win-arm64: ● source
   via: myapp → uvicorn → uvloop
@@ -106,56 +116,68 @@ If you think wheelgap got a package wrong, that output (or `--json --explain`) i
 
 **Exit codes:** `0` no gaps, `1` gaps found, `2` bad input. `--exit-zero` always exits `0`. `--fail-on missing` (or `fail-on = "missing"` in `[tool.wheelgap]`) accepts source builds and only exits `1` when a package can't be installed at all.
 
-Use `-q` / `--quiet` (or `quiet = true` in `[tool.wheelgap]`) to show only the gap summary and package names. Clean runs are silent, JSON output is unchanged, and quiet mode cannot be combined with `--explain`.
+Use `-q` / `--quiet` (or `quiet = true` in `[tool.wheelgap]`) to show only the gap summary and package names. Clean runs are silent, JSON and Markdown output are unchanged, and quiet text output cannot be combined with `--explain` (`--json --explain` and `--markdown --explain` work).
 
 ### Targets
 
 Run `wheelgap --list-targets` to see target aliases and compatibility limits, or add `--json` for a machine-readable list.
 
+Only x86 Linux takes `manylinux` wheels older than glibc 2.17: every other architecture's first manylinux was `manylinux2014` (glibc 2.17), so pip accepts nothing older there, and neither does wheelgap.
+
 | name | aliases | wheel tags it accepts |
 | --- | --- | --- |
 | `linux-x86_64` | `linux`, `linux-amd64`, `linux/amd64` | `manylinux_2_*_x86_64` up to `--glibc` (default 2.36), legacy `manylinux2014`/`2010`/`1` |
-| `linux-aarch64` | `linux-arm64`, `linux/arm64`, `linux/arm64/v8` | `manylinux_2_*_aarch64` |
+| `linux-aarch64` | `linux-arm64`, `linux/arm64`, `linux/arm64/v8` | `manylinux_2_*_aarch64` from 2.17 up to `--glibc`, legacy `manylinux2014` |
 | `musl-x86_64` | `alpine`, `musl` | `musllinux_1_*_x86_64` up to `--musl` (default 1.2) |
 | `musl-aarch64` | `alpine-arm64` | `musllinux_1_*_aarch64` |
 | `macos-arm64` | `macos`, `mac` | `macosx_*_arm64` and `universal2` up to `--macos` (default 14.0) |
 | `macos-x86_64` | `macos-intel` | `macosx_*_x86_64` and `universal2` |
 | `win-amd64` | `windows`, `win` | `win_amd64` |
 | `win-arm64` | `windows-arm64` | `win_arm64` |
+| `linux-armv7l` | `linux-arm`, `linux-armv7`, `linux/arm/v7` | `manylinux_2_*_armv7l` from 2.17 (32-bit ARM, e.g. Raspberry Pi OS), legacy `manylinux2014`, and plain `linux_armv7l` (which PyPI allows for the Pi) |
+| `linux-ppc64le`, `linux-s390x`, `linux-riscv64` | `linux/ppc64le`, `linux/s390x`, `linux/riscv64` | `manylinux_2_*` from 2.17 for that arch (`riscv64` has no legacy `manylinux2014` tag) |
+| `musl-armv7l`, `musl-ppc64le`, `musl-s390x`, `musl-riscv64` | `alpine-armv7` | `musllinux_1_*` for that arch (pip would also take a plain `linux_armv7l` wheel on Alpine, but it's a glibc build, so wheelgap doesn't count it) |
 | `pyodide` | `wasm`, `wasm32`, `emscripten` | Pyodide's ABI for that Python: `pyodide_2024_0` (3.12), `pyodide_2025_0` / `pyemscripten_2025_0` (3.13), `pyemscripten_2026_0` (3.14) |
+| `ios-arm64` | `ios`, `iphoneos` | `ios_*_arm64_iphoneos` up to `--ios` (default 13.0) |
+| `ios-simulator-arm64`, `ios-simulator-x86_64` | `ios-simulator` | `ios_*_arm64_iphonesimulator` / `ios_*_x86_64_iphonesimulator` |
+| `android-arm64`, `android-x86_64` | `android` | `android_*_arm64_v8a` / `android_*_x86_64` up to `--android-api` (default 24) |
 
-**Pyodide (Python in the browser)** only installs wheels: there's no compiler, so a package with only an sdist shows as `✗ missing`, not `● source`. Pyodide wheels are tied to one ABI per Python version and don't work across them. Pyodide also ships its own builds of many popular packages (numpy, pydantic-core and others) that aren't on PyPI. Point `--pyodide-lock` at the release's `pyodide-lock.json` (a path or URL, also `pyodide-lock = "..."` in `[tool.wheelgap]`) and those count as `✓ bundled`, with a note when Pyodide's version differs from the one you pinned:
+**iOS and Android** (PEP 730 and PEP 738, Python 3.13+) are checked with `-t mobile` or by name, for apps built with tools like BeeWare's Briefcase. Mobile dependencies are installed by a cross-platform pip run that can only use wheels, so a package with only an sdist shows as `✗ missing`. `--ios` and `--android-api` (or `ios = "15.0"` and `android-api = 28` in `[tool.wheelgap]`) set your app's minimum iOS version and Android API level. wheelgap checks PyPI only: Briefcase and Chaquopy also install from their own package repositories (BeeWare's on anaconda.org, and chaquo.com), which have mobile builds of packages like numpy, so a `✗ missing` there may still install.
+
+**Pyodide (Python in the browser)** only installs wheels: there's no compiler, so a package with only an sdist shows as `✗ missing`, not `● source`. Pyodide wheels are tied to one ABI per Python version and don't work across them. Pyodide also ships its own builds of many popular packages (numpy, pydantic-core and others) that aren't on PyPI. Point `--pyodide-lock` at the release's `pyodide-lock.json` (a path or `https://` URL, also `pyodide-lock = "..."` in `[tool.wheelgap]`) and those count as `✓ bundled`, with a note when Pyodide's version differs from the one you pinned:
 
 ```bash
 wheelgap -p 3.12 -t pyodide --pyodide-lock https://cdn.jsdelivr.net/pyodide/v0.27.7/full/pyodide-lock.json
 ```
 
-Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm64` (also `linux/arm64/v8`).
+Docker platform names also work with `-t`, for example `-t linux/amd64,linux/arm64` (also `linux/arm64/v8`, `linux/arm/v7`, `linux/ppc64le`, `linux/s390x` and `linux/riscv64`).
 
-`-t all` checks the eight native platforms; Pyodide is only checked when you name it. Python versions take a trailing `t` for free-threaded builds (`3.14t`), which correctly rejects `abi3` wheels. Without `-p`, wheelgap reads a `.python-version` file next to the lockfile (or `pyproject.toml`) if there is one, and otherwise uses the Python it is running on.
+`-t all` checks the eight common native platforms, and `-t everything` adds the armv7l, ppc64le, s390x and riscv64 Linux targets (glibc and musl). Pyodide, iOS and Android are only checked when you name them. Python versions take a trailing `t` for free-threaded builds (`3.14t`), which correctly rejects `abi3` wheels. Without `-p`, wheelgap reads a `.python-version` file next to the lockfile (or `pyproject.toml`) if there is one, and otherwise uses the Python it is running on.
 
 ### In CI (GitHub Action)
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: wheelgap/wheelgap@v0.4.0
+- uses: wheelgap/wheelgap@v0.6.2
   with:
     args: uv.lock -p 3.13 -t linux-x86_64,linux-aarch64
 ```
 
-The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels.
+The job fails when a dependency would build from source on a target you ship, for example when a dependency bump drops ARM wheels. The gap table also goes to the run's summary page (set `summary: false` to turn that off).
+
+Outside the Action, `--markdown` prints the same report as Markdown, for a job summary (`wheelgap --markdown >> "$GITHUB_STEP_SUMMARY"`) or a PR comment. With `--explain`, the rejected wheels go in a collapsed section.
 
 ### With pre-commit
 
 ```yaml
 repos:
   - repo: https://github.com/wheelgap/wheelgap
-    rev: v0.4.0
+    rev: v0.6.2
     hooks:
       - id: wheelgap
 ```
 
-The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock` or a `requirements*.txt` file changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example `args: [--fail-on, missing]`.
+The hook runs when `uv.lock`, `poetry.lock`, `pdm.lock`, `pylock.toml`, `Pipfile.lock`, or a `requirements*.txt` or `requirements*.lock` file changes. Put your targets in `[tool.wheelgap]` in `pyproject.toml` so the hook checks the right platforms. Pass extra options with `args:`, for example `args: [--fail-on, missing]`.
 
 ### From Python
 
@@ -181,15 +203,19 @@ for r in wheelgap.check_lockfile("uv.lock", targets):  # markers and the uv grap
 python -m wheelgap.scan --top 5000 --out coverage.json
 ```
 
-This checks the latest release of the most-downloaded packages (from [top-pypi-packages](https://hugovk.dev/top-pypi-packages/)) against every platform, for Python 3.13, 3.14 and 3.14t by default, and writes one JSON file with per-platform totals. It's the data behind the [coverage tracker on the roadmap](https://github.com/wheelgap/wheelgap/discussions/43).
+This checks the latest release of the most-downloaded packages (from [top-pypi-packages](https://hugovk.dev/top-pypi-packages/)) against the eight common platforms (and Pyodide), for Python 3.13, 3.14 and 3.14t by default, and writes one JSON file with per-platform totals. It's the data behind the [coverage tracker on the roadmap](https://github.com/wheelgap/wheelgap/discussions/43).
+
+### Distro names
+
+`--distro NAME` sets the glibc (or musl for Alpine) version from a built-in table, so you can say `--distro ubuntu-22.04` instead of looking up the glibc version. Explicit `--glibc` / `--musl` still win. Known names include `ubuntu-20.04`, `ubuntu-22.04`, `ubuntu-24.04`, `debian-11`/`bullseye`, `debian-12`/`bookworm`, `debian-13`/`trixie`, `rhel-8`/`rocky-8`/`alma-8`, `rhel-9`/`rocky-9`/`alma-9`, `amazonlinux-2`, `amazonlinux-2023`, and `alpine`.
 
 ## How it works
 
-- **Lockfiles are read offline.** `uv.lock`, `pylock.toml`, `poetry.lock` and `pdm.lock` already record every file published for each pinned version. wheelgap parses the wheel filenames' tags with [`packaging`](https://packaging.pypa.io/) and checks them against the exact tag set each target accepts. That is the same logic pip and uv use to pick a wheel.
-- **`requirements.txt` and bare package names** are looked up on the PyPI JSON API. Feed it a fully pinned file (from `uv pip compile`, `pip-compile` or `uv export`): wheelgap checks the lines you give it and doesn't resolve dependencies.
-- **`Pipfile.lock`** reads both `default` and `develop` dependencies and looks up distribution filenames on PyPI for their pinned versions. Environment markers are preserved; Git, path, file and editable dependencies are skipped as non-index packages.
+- **Lockfiles are read offline.** `uv.lock`, `pylock.toml`, `poetry.lock` and `pdm.lock` already record every file published for each pinned version (except a `uv.lock` or `pylock.toml` whose `requires-python` leaves out the Python you check; see below). wheelgap parses the wheel filenames' tags with [`packaging`](https://packaging.pypa.io/) and checks them against the exact tag set each target accepts. That is the same logic pip and uv use to pick a wheel.
+- **`requirements.txt`, `requirements.lock` and bare package names** are looked up on the PyPI JSON API. Feed it a fully pinned file (from Rye, `uv pip compile`, `pip-compile` or `uv export`): wheelgap checks the lines you give it and doesn't resolve dependencies. Rye's default (non-universal) locks are resolved for the machine that created them and carry no platform markers.
+- **`Pipfile.lock`** reads `default`, `develop` and any custom package categories (such as `docs` or `tests`) and looks up distribution filenames on PyPI for their pinned versions. Environment markers are preserved; Git, path, file and editable dependencies are skipped as non-index packages.
 - **Environment markers are respected.** A `pywin32 ; sys_platform == 'win32'` dependency won't show up as a Linux gap. For `uv.lock` the dependency graph is walked per target, so transitive platform-specific packages are handled too.
-- `--online` re-checks lockfile packages against PyPI. Use it when a project has uploaded new wheels for an existing version since you locked, or if your `uv.lock` was generated with `environments` restrictions.
+- `--online` re-checks lockfile packages against PyPI. Use it when a project has uploaded new wheels for an existing version since you locked, or if your `uv.lock` was generated with `environments` restrictions. A `uv.lock` or `pylock.toml` whose `requires-python` leaves out a target's Python (say `==3.13.*`, checked with `-p 3.14t`) may be missing wheels for it, because uv only keeps the wheels that can serve `requires-python`. Without `--online`, wheelgap then also looks up its PyPI packages on the index, keeps the lock's own files if a lookup fails, and prints a note (with `-q`, only when some packages couldn't be re-checked).
 
 ## Why this exists
 
@@ -205,13 +231,13 @@ Sites like [pyreadiness.org](https://pyreadiness.org) and [free-threaded wheels]
 
 wheelgap is growing into **caniuse for Python wheels**: an open map of which packages have wheels for which platforms. The CLI stays focused, and around it come a nightly tracker of the most-used PyPI packages, a community knowledge base of workarounds, and campaigns to help upstream projects ship missing wheels. **[Read the roadmap and join the discussion →](https://github.com/wheelgap/wheelgap/discussions/43)**
 
-Next up for the CLI: iOS and Android targets (#11), private indexes (#19), and "nearest version with a wheel" hints (#20).
+Next up for the CLI: private indexes (#19), and "nearest version with a wheel" hints (#20).
 
 Contributions welcome. Issues labelled [good first issue](https://github.com/wheelgap/wheelgap/labels/good%20first%20issue) are a good start, and [CONTRIBUTING.md](CONTRIBUTING.md) has the 3-command dev setup. Questions are welcome in [Discussions](https://github.com/wheelgap/wheelgap/discussions).
 
 ## Maintainer
 
-wheelgap is created and maintained by [@patrickballard](https://github.com/patrickballard), with help from [its contributors](https://github.com/wheelgap/wheelgap/graphs/contributors).
+wheelgap is created and maintained by [@patrickballard](https://github.com/patrickballard), with a lot of help from [its contributors](https://github.com/wheelgap/wheelgap/graphs/contributors). Thank you, all of you!
 
 ## License
 

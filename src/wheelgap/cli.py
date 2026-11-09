@@ -15,20 +15,29 @@ from .api import running_python
 from .check import Row, Status, check, explain, has_sdist
 from .dockerfile import DockerfileError, read_dockerfile
 from .pyodide import PyodideLock, PyodideLockError, apply_bundled, check_targets, load_pyodide_lock
-from .pypi import fill_all
-from .sources import SourceError, load_inputs
+from .pypi import check_index_url, fill_all, recheck_lock
+from .sources import Package, SourceError, load_inputs, pythons_outside_lock
 from .targets import (
+    DISTROS,
     ALIASES,
+    DEFAULT_ANDROID_API,
     DEFAULT_GLIBC,
+    DEFAULT_IOS,
     DEFAULT_MACOS,
     DEFAULT_MUSL,
     DEFAULT_PLATFORMS,
+    EXTRA_ARCHES,
+    MANYLINUX_FLOOR,
+    MANYLINUX_X86_ARCHES,
     PLATFORMS,
     PYODIDE_PLATFORMS,
     Target,
     TargetError,
     build_targets,
+    parse_api_level,
+    parse_ios_version,
     parse_version_pair,
+    resolve_platform,
 )
 
 EXAMPLES = """\
@@ -40,6 +49,20 @@ examples:
   wheelgap requirements.txt --json         machine-readable output for CI
   wheelgap -t alpine-arm64 --explain       show which wheels were rejected, and why
 """
+
+
+def musl_docker_names(item: str) -> str:
+    """With an Alpine image, `-t linux/arm64` means musl on arm64: Docker names say only the architecture.
+
+    wheelgap's own names (linux-aarch64, musl-aarch64) are left alone, since they name the libc too.
+    """
+    out = []
+    for name in item.split(","):
+        if "/" in name:
+            resolved = resolve_platform(name)
+            name = resolved.replace("linux-", "musl-", 1) if resolved.startswith("linux-") else resolved
+        out.append(name)
+    return ",".join(out)
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -73,33 +96,49 @@ def make_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="PLATFORM",
-        help=f"target platform (repeatable, or 'all'; default: {','.join(DEFAULT_PLATFORMS)})",
+        help=(
+            "target platform (repeatable; 'all' for the 8 common ones, 'everything' adds armv7l, ppc64le, "
+            f"s390x and riscv64 Linux, 'mobile' is iOS and Android; default: {','.join(DEFAULT_PLATFORMS)})"
+        ),
     )
     p.add_argument("--glibc", metavar="X.Y", help=f"glibc version for linux-* targets (default: {DEFAULT_GLIBC})")
     p.add_argument("--musl", metavar="X.Y", help=f"musl version for musl-* targets (default: {DEFAULT_MUSL})")
+    p.add_argument("--distro", metavar="NAME", help="set --glibc or --musl from a distro name (e.g. ubuntu-22.04, alpine)")
     p.add_argument("--macos", metavar="X.Y", help=f"minimum macOS for macos-* targets (default: {DEFAULT_MACOS})")
+    p.add_argument("--ios", metavar="X.Y", help=f"minimum iOS for ios-* targets (default: {DEFAULT_IOS})")
+    p.add_argument(
+        "--android-api",
+        metavar="N",
+        help=f"minimum Android API level for android-* targets (default: {DEFAULT_ANDROID_API})",
+    )
     p.add_argument(
         "--dockerfile",
         metavar="PATH",
-        help="take -p/-t (and --glibc/--musl) from the last FROM line, e.g. FROM python:3.13-alpine",
+        help="take -p/-t (and --glibc/--musl) from the final stage's image, e.g. FROM python:3.13-alpine",
     )
     p.add_argument(
         "--pyodide-lock",
-        metavar="PATH_OR_URL",
+        metavar="PATH_OR_HTTPS_URL",
         help="a Pyodide release's pyodide-lock.json: packages Pyodide ships itself count as available on -t pyodide",
     )
     p.add_argument(
         "--online", action="store_true", help="re-check lockfile packages against PyPI instead of trusting the lockfile"
     )
     p.add_argument("--all", action="store_true", help="show every package, not just the ones with gaps")
-    detail = p.add_mutually_exclusive_group()
-    detail.add_argument(
-        "--explain", action="store_true", help="for each gap, list the wheels that were rejected and why"
-    )
-    detail.add_argument(
-        "-q", "--quiet", action="store_true", help="print only the gap summary and affected package names"
+    p.add_argument("--explain", action="store_true", help="for each gap, list the wheels that were rejected and why")
+    p.add_argument(
+        "-q",
+        "--quiet",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="print only the gap summary and affected package names (--no-quiet overrides quiet = true)",
     )
     p.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    p.add_argument(
+        "--markdown",
+        action="store_true",
+        help="print a Markdown report (e.g. for $GITHUB_STEP_SUMMARY) instead of a table",
+    )
     p.add_argument("--exit-zero", action="store_true", help="exit 0 even when gaps are found")
     p.add_argument(
         "--fail-on",
@@ -114,7 +153,7 @@ def make_parser() -> argparse.ArgumentParser:
 
 FAIL_ON = ("source", "missing")
 LIST_KEYS = ("python", "targets")
-STR_KEYS = ("glibc", "musl", "macos", "fail-on", "pyodide-lock")
+STR_KEYS = ("glibc", "musl", "macos", "ios", "android-api", "fail-on", "pyodide-lock", "distro")
 
 
 def project_dir(inputs: list[str]) -> Path:
@@ -143,7 +182,7 @@ def read_python_version(folder: Path) -> list[str]:
     if not path.is_file():
         return []
     versions = []
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in path.read_text(encoding="utf-8-sig").splitlines():  # -sig: Windows editors add a BOM
         entry = line.split("#", 1)[0].strip()
         if not entry:
             continue
@@ -168,8 +207,18 @@ def load_config(path: Path) -> dict:
             if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
                 raise SourceError(f"{path}: [tool.wheelgap] {key} must be a list of strings")
         elif key in STR_KEYS:
+            if key == "android-api" and isinstance(value, int) and not isinstance(value, bool):
+                value = str(value)  # an API level is naturally written as a number
             if not isinstance(value, str):
-                raise SourceError(f'{path}: [tool.wheelgap] {key} must be a string like "2.31"')
+                example = {
+                    "android-api": 'an integer or a string like "24"',
+                    "ios": 'a string like "13.0"',
+                    "musl": 'a string like "1.2"',
+                    "macos": 'a string like "14.0"',
+                    "fail-on": 'a string like "missing"',
+                    "pyodide-lock": "a path or URL string",
+                }.get(key, 'a string like "2.31"')
+                raise SourceError(f"{path}: [tool.wheelgap] {key} must be {example}")
             if key == "fail-on" and value not in FAIL_ON:
                 raise SourceError(f"{path}: [tool.wheelgap] fail-on must be one of: {', '.join(FAIL_ON)}")
         elif key == "quiet":
@@ -335,26 +384,41 @@ def report_json(
     )
 
 
-def print_target_list(args: argparse.Namespace) -> None:
+def print_target_list(args: argparse.Namespace, config: dict) -> None:
     aliases: dict[str, list[str]] = {name: [] for name in PLATFORMS}
     for alias, name in ALIASES.items():
         aliases[name].append(alias)
 
     versions = {
-        "manylinux": ("glibc", args.glibc or DEFAULT_GLIBC),
-        "musllinux": ("musl", args.musl or DEFAULT_MUSL),
-        "macos": ("macOS", args.macos or DEFAULT_MACOS),
+        "manylinux": ("glibc", args.glibc or config.get("glibc", DEFAULT_GLIBC)),
+        "musllinux": ("musl", args.musl or config.get("musl", DEFAULT_MUSL)),
+        "macos": ("macOS", args.macos or config.get("macos", DEFAULT_MACOS)),
     }
     limits = {}
     for family, (label, version) in versions.items():
         major, minor = parse_version_pair(version, label)
         limits[family] = f", {label} <= {major}.{minor}"
+    major, minor = parse_ios_version(args.ios or config.get("ios", DEFAULT_IOS))
+    limits["ios"] = f", iOS <= {major}.{minor}"
     pythons = ", ".join(f"{a}.{b}" for a, b in PYODIDE_PLATFORMS)
     limits["pyodide"] = f", Python {pythons} (not in -t all)"
+    limits["ios"] += " (wheels only; -t mobile, not in -t all)"
+    api = parse_api_level(args.android_api or config.get("android-api", DEFAULT_ANDROID_API))
+    limits["android"] = f", API level <= {api} (wheels only; -t mobile, not in -t all)"
 
-    rows = [
-        (name, aliases[name], f"{family} {arch}{limits.get(family, '')}") for name, (family, arch) in PLATFORMS.items()
-    ]
+    glibc = parse_version_pair(versions["manylinux"][1], "glibc")
+    if glibc[0] == MANYLINUX_FLOOR[0]:  # pip's 2.17 floor outside x86 (no manylinux before manylinux2014)
+        floor = ".".join(map(str, MANYLINUX_FLOOR))
+        below = f", no manylinux (glibc {glibc[0]}.{glibc[1]} is below the {floor} floor)"
+        floored = f", glibc {floor} to {glibc[0]}.{glibc[1]}" if glibc >= MANYLINUX_FLOOR else below
+    else:
+        floored = limits["manylinux"]
+
+    def accepted(family: str, arch: str) -> str:
+        limit = floored if family == "manylinux" and arch not in MANYLINUX_X86_ARCHES else limits.get(family, "")
+        return f"{family} {arch}{limit}{' (not in -t all)' * (arch in EXTRA_ARCHES)}"
+
+    rows = [(name, aliases[name], accepted(family, arch)) for name, (family, arch) in PLATFORMS.items()]
     if args.json:
         print(
             json.dumps(
@@ -372,19 +436,105 @@ def print_target_list(args: argparse.Namespace) -> None:
     print("Docker platform names like linux/arm64 also work.")
 
 
+def worst_status(row: Row) -> Status:
+    """The status that best describes a gap package: can't install, then unknown, then from source."""
+    for s in (Status.MISSING, Status.UNKNOWN, Status.SOURCE):
+        if s in row.results.values():
+            return s
+    return Status.WHEEL
+
+
 def gap_summary(gaps: list[Row], total: int, style: Style) -> str:
-    source = sum(any(s is Status.SOURCE for s in r.results.values()) for r in gaps)
-    missing = sum(any(s is Status.MISSING for s in r.results.values()) for r in gaps)
+    # Each package is counted once, under its worst status, so the parts always add up to len(gaps).
+    worst = [worst_status(r) for r in gaps]
+    source, missing, unknown = (worst.count(s) for s in (Status.SOURCE, Status.MISSING, Status.UNKNOWN))
     parts = []
     if source:
         parts.append(style.yellow(f"{source} will build from source"))
     if missing:
         parts.append(style.red(f"{missing} can't install at all"))
-    unknown = len(gaps) - source - missing
-    if unknown > 0:
+    if unknown:
         parts.append(style.dim(f"{unknown} unknown"))
     verb = "has" if len(gaps) == 1 else "have"
-    return f"{style.bold(f'{len(gaps)} of {total} packages')} {verb} gaps: " + ", ".join(parts) + "."
+    noun = "package" if total == 1 else "packages"
+    return f"{style.bold(f'{len(gaps)} of {total} {noun}')} {verb} gaps: " + ", ".join(parts) + "."
+
+
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]<>#|~&])")
+
+
+def _md(text: str) -> str:
+    """Escape text so Markdown shows it literally (paths like ./__internal__/ stay as written)."""
+    return _MD_SPECIAL.sub(r"\\\1", text)
+
+
+def _code(text: str) -> str:
+    """A Markdown code span showing text exactly (paths and URLs stay readable and unlinked)."""
+    if not text:
+        return '`""`'  # `` isn't a code span, and would pair up with the backticks after it
+    fence = "`" * (max((len(run) for run in re.findall(r"`+", text)), default=0) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"  # only used outside tables, so | needs no escaping
+
+
+def render_markdown(
+    rows: list[Row],
+    targets: list[Target],
+    source_labels: list[str],
+    skipped: list[Package],
+    args: argparse.Namespace,
+    pyodide_lock: PyodideLock | None,
+    source_allowed: bool = False,
+) -> list[str]:
+    """The same report as the text output, as GitHub-flavoured Markdown (for a job summary or a PR comment)."""
+    plain = Style(False)
+    gaps = [r for r in rows if not r.ok]
+    n_t = len(targets)
+    if gaps:
+        noun = "package" if len(rows) == 1 else "packages"
+        out = [f"### wheelgap: {len(gaps)} of {len(rows)} {noun} {'has' if len(gaps) == 1 else 'have'} gaps", ""]
+    else:
+        out = [
+            f"### wheelgap: every package has a wheel for {'all ' if n_t > 1 else ''}{n_t} target{'s' * (n_t > 1)}",
+            "",
+        ]
+    pys = ", ".join(dict.fromkeys(t.python for t in targets))
+    n_pkgs = f"{len(rows)} package{'s' * (len(rows) != 1)}"
+    out += [f"wheelgap {__version__} · {' + '.join(map(_code, source_labels))} · {n_pkgs} · Python {pys}", ""]
+
+    shown = rows if args.all else gaps
+    if shown:
+        multi_py = len({t.python for t in targets}) > 1
+        headers = ["package", "version"] + [t.label(multi_py) for t in targets]
+        out.append("| " + " | ".join(_md(h) for h in headers) + " |")
+        out.append("| " + " | ".join("---" for _ in headers) + " |")
+        for r in shown:
+            cells = [r.package.name, r.package.version or "?"] + [CELL[r.results[t]][0] for t in targets]
+            out.append("| " + " | ".join(_md(c) for c in cells) + " |")
+        out.append("")
+        hidden = len(rows) - len(shown)
+        if hidden:
+            noun = "package" if hidden == 1 else "packages"
+            out += [f"{hidden} {noun} with wheels for every target hidden (`--all` to show).", ""]
+
+    if gaps:
+        out += [gap_summary(gaps, len(rows), plain), ""]
+        if source_allowed:
+            out += ["Source builds are allowed (fail-on missing), so this run passes.", ""]
+    bundled = [r for r in rows if Status.BUNDLED in r.results.values()]
+    if bundled and pyodide_lock:
+        out += [_md(bundled_line(bundled, pyodide_lock)), ""]
+    if skipped:
+        names = ", ".join(f"{_code(p.name)} ({p.skip})" for p in skipped)
+        out += [f"Skipped {len(skipped)} non-index package{'s' * (len(skipped) != 1)}: {names}", ""]
+    for r in rows:
+        if r.package.error:
+            out += [f"Could not check {_md(r.package.name)}: {_code(r.package.error)}", ""]
+    if args.explain and gaps:
+        # Fenced, so wheel filenames and reasons need no escaping.
+        lines = render_explain(gaps, targets, plain)
+        out += ["<details><summary>Why (rejected wheels)</summary>", "", "```", *lines, "```", "", "</details>", ""]
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -392,36 +542,75 @@ def main(argv: list[str] | None = None) -> int:
         # Don't crash printing ✓ to a non-UTF-8 pipe (e.g. Windows cp1252).
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure:
-            reconfigure(errors="replace")
+            # Windows pipes (CI logs) default to cp1252, which would turn ✓ into "?"; write UTF-8 instead.
+            # A console (isatty) already handles Unicode, and PYTHONIOENCODING is the user's choice.
+            encoding = (getattr(stream, "encoding", "") or "").lower().replace("-", "")
+            if encoding != "utf8" and not stream.isatty() and not os.environ.get("PYTHONIOENCODING"):
+                reconfigure(encoding="utf-8", errors="replace")
+            else:
+                reconfigure(errors="replace")
     parser = make_parser()
     args = parser.parse_args(argv)
+    if args.json and args.markdown:
+        parser.error("--json and --markdown can't be used together")
+    if args.list_targets and args.markdown:
+        parser.error("--list-targets has no Markdown form (use --json)")
     try:
         if args.list_targets:
-            print_target_list(args)
+            pyproject = find_pyproject(args.inputs)
+            print_target_list(args, load_config(pyproject) if pyproject else {})
             return 0
         pyproject = find_pyproject(args.inputs)
         config = load_config(pyproject) if pyproject else {}
-        quiet = args.quiet or config.get("quiet", False)
-        if quiet and args.explain:
-            parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true)")
+        quiet = args.quiet if args.quiet is not None else config.get("quiet", False)
+        # Quiet only changes the text output, so it can't clash with --explain when printing JSON or Markdown.
+        if quiet and args.explain and not (args.json or args.markdown):
+            parser.error("--explain cannot be used with quiet mode (--quiet or quiet = true; --no-quiet turns it off)")
         if args.dockerfile:
             # The image beats pyproject.toml; flags still win.
             image = read_dockerfile(Path(args.dockerfile))
+            if image.platform.startswith("musl-") and args.target:
+                args.target = [musl_docker_names(item) for item in args.target]
             config.update(python=[image.python], targets=[image.platform])
             config.update({k: v for k, v in (("glibc", image.glibc), ("musl", image.musl)) if v})
+        # Apply --distro if given (explicit --glibc/--musl still win)
+        distro_name = args.distro or config.get("distro")
+        if distro_name:
+            distro_name = distro_name.lower()
+            if distro_name not in DISTROS:
+                known = ", ".join(sorted(DISTROS))
+                parser.error(f"unknown distro {distro_name!r}; known: {known}")
+            version = DISTROS[distro_name]
+            if "alpine" in distro_name:
+                if not args.musl:
+                    args.musl = version
+            else:
+                if not args.glibc:
+                    args.glibc = version
+
         targets = build_targets(
             args.python or config.get("python") or read_python_version(project_dir(args.inputs)) or [running_python()],
             args.target or config.get("targets", []),
             args.glibc or config.get("glibc", DEFAULT_GLIBC),
             args.musl or config.get("musl", DEFAULT_MUSL),
             args.macos or config.get("macos", DEFAULT_MACOS),
+            args.ios or config.get("ios", DEFAULT_IOS),
+            args.android_api or config.get("android-api", DEFAULT_ANDROID_API),
         )
+        check_index_url()
         sources = load_inputs(args.inputs or ["."])
         fail_on = args.fail_on or config.get("fail-on", "source")
         pyodide_lock = None
-        if lock_spec := args.pyodide_lock or config.get("pyodide-lock"):
+        if args.pyodide_lock:
+            pyodide_lock = load_pyodide_lock(args.pyodide_lock)
+            check_targets(pyodide_lock, targets)  # asked for explicitly, so a mismatch is an error
+        elif (lock_spec := config.get("pyodide-lock")) and any(PLATFORMS[t.platform][0] == "pyodide" for t in targets):
+            # A project default: only read (or fetched) on runs that check a pyodide target, so it never
+            # affects `wheelgap -t linux` in the same project. A relative path is relative to pyproject.toml.
+            if pyproject and not lock_spec.lower().startswith(("http://", "https://")):
+                lock_spec = str(pyproject.parent / lock_spec)
             pyodide_lock = load_pyodide_lock(lock_spec)
-            check_targets(pyodide_lock, targets)
+            check_targets(pyodide_lock, targets)  # pyodide targets but none for this lock's Python: say so
     except (TargetError, SourceError, DockerfileError, PyodideLockError, OSError) as e:
         print(f"wheelgap: error: {e}", file=sys.stderr)
         return 2
@@ -431,6 +620,21 @@ def main(argv: list[str] | None = None) -> int:
 
     packages = [p for s in sources for p in s.packages]
     fill_all(packages, refresh=args.online)
+    if not args.online:
+        for s in sources:
+            if outside := pythons_outside_lock(s, targets):
+                other, failed = recheck_lock(s.packages)
+                note = (
+                    f"wheelgap: note: {s.label} is locked for Python {s.requires_python}, so it may be missing "
+                    f"wheels for Python {', '.join(outside)}; looked its PyPI packages up on the index too"
+                )
+                unchecked = [f"{other} from other indexes"] * bool(other) + [
+                    f"{failed} that couldn't be looked up"
+                ] * bool(failed)
+                if unchecked:
+                    note += f"; {' and '.join(unchecked)} may show false gaps for those Pythons"
+                if unchecked or not quiet:  # quiet runs stay quiet unless the answer may be wrong
+                    print(note, file=sys.stderr)
     skipped = [p for p in packages if p.skip]
     rows = [r for r in check(sources, targets) if r.needed]
     if pyodide_lock:
@@ -446,11 +650,19 @@ def main(argv: list[str] | None = None) -> int:
         print(report_json(rows, targets, source_labels, skipped, args.explain, pyodide_lock))
         return code
 
+    if args.markdown:
+        source_allowed = bool(gaps) and not failing  # judged on --fail-on alone, not --exit-zero
+        print("\n".join(render_markdown(rows, targets, source_labels, skipped, args, pyodide_lock, source_allowed)))
+        return code
+
     style = Style(use_color(args.color))
     if quiet:
         if gaps:
             print(gap_summary(gaps, len(rows), style))
             print("gaps: " + ", ".join(r.package.name for r in gaps))
+        for r in rows:
+            if r.package.error:  # say why a package is "unknown", even in quiet mode
+                print(f"wheelgap: could not check {r.package.name}: {r.package.error}", file=sys.stderr)
         return code
 
     pys = ", ".join(dict.fromkeys(t.python for t in targets))
