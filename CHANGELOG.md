@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The summary line says "1 of 1 package", not "1 of 1 packages". (#81, thanks [@HarshRajSinghania](https://github.com/HarshRajSinghania))
+
 ## 0.6.0 (2026-11-09)
 
 New targets for phones and more Linux hardware, and a job summary for the GitHub Action.
